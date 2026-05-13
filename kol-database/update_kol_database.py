@@ -38,6 +38,17 @@ APR_EXCEL  = Path.home() / "Downloads" / "4月土耳其达人评级表.xlsx"
 API_URL = "https://inner-operations.verdent.ai/inner/talent/promotion/list"
 
 # ─────────────────────────────────────────
+# 达人池黑名单（手动删除的达人，防止自动重新入池）
+# ─────────────────────────────────────────
+POOL_BLACKLIST = {
+    "kodumun.muhendisi",
+    "cankatko",
+    "HQ NET",
+    "volkan.js",
+    "AI Mevzuları | Yapay Zeka",
+}
+
+# ─────────────────────────────────────────
 # 评级颜色
 # ─────────────────────────────────────────
 GRADE_COLORS = {
@@ -872,10 +883,10 @@ def update_pool_from_detail(detail_df, pool_df):
         return pool_df
 
     # ── 手工保留字段（不自动覆盖）──
-    MANUAL_FIELDS = ["达人背景", "粉丝量", "联系方式", "是否有过自建联", "备注"]
+    MANUAL_FIELDS = ["粉丝量", "联系方式"]
     AUTO_FIELDS   = ["视频类型", "发布平台", "过往单次花费", "评级"]
     POOL_COLS     = ["达人", "视频类型", "发布平台", "过往单次花费", "评级",
-                     "达人背景", "粉丝量", "联系方式", "是否有过自建联", "备注"]
+                     "粉丝量", "联系方式"]
 
     # ── 构建现有池的手工信息字典：kol_name → {field: value} ──
     existing_manual = {}
@@ -894,12 +905,16 @@ def update_pool_from_detail(detail_df, pool_df):
     # ── 扫描视频明细，找出符合条件的达人 ──
     qualifying_kols = set()
     for kol, grp in detail_df.groupby("达人"):
+        kol_name = str(kol).strip()
+        # 黑名单达人不得入池
+        if kol_name in POOL_BLACKLIST:
+            continue
         short_grades = grp.loc[grp["视频类型"] == "短视频", "评级"].tolist()
         long_grades  = grp.loc[grp["视频类型"] == "长视频",  "评级"].tolist()
         ok_short = any(g == "S" for g in short_grades)
         ok_long  = any(g in ("S", "A", "B") for g in long_grades)
         if ok_short or ok_long:
-            qualifying_kols.add(str(kol).strip())
+            qualifying_kols.add(kol_name)
 
     print(f"  [达人池] 符合条件达人: {len(qualifying_kols)} 人 | "
           f"已在池中: {len(existing_in_pool)} 人")
@@ -934,10 +949,10 @@ def update_pool_from_detail(detail_df, pool_df):
         row.update(manual)
         new_pool_rows.append(row)
 
-    # ── 处理已在池中但不再符合条件的达人（保留 + 标注备注）──
+    # ── 处理已在池中但不再符合条件的达人（保留）──
     no_longer_qualifying = existing_in_pool - qualifying_kols
     if no_longer_qualifying:
-        print(f"  [达人池] 不再符合条件（保留并标注）: {sorted(no_longer_qualifying)}")
+        print(f"  [达人池] 不再符合条件（保留）: {sorted(no_longer_qualifying)}")
     for kol in no_longer_qualifying:
         if not pool_df.empty:
             old_rows = pool_df[pool_df["达人"] == kol]
@@ -946,11 +961,6 @@ def update_pool_from_detail(detail_df, pool_df):
                     c: (str(old_row.get(c, "")) if pd.notna(old_row.get(c, "")) else "")
                     for c in POOL_COLS
                 }
-                # 在备注中追加标注（避免重复添加）
-                note = str(row.get("备注", "")).strip()
-                marker = "[已不符合入池条件]"
-                if marker not in note:
-                    row["备注"] = (note + " " + marker).strip()
                 new_pool_rows.append(row)
 
     # ── 构建新 pool_df，确保列顺序一致 ──
@@ -965,6 +975,136 @@ def update_pool_from_detail(detail_df, pool_df):
     print(f"  [达人池] 新增 {added} 人 | 更新 {updated} 人 | 标注不符合 {len(no_longer_qualifying)} 人 | "
           f"池总人数: {len(new_pool_df)}")
     return new_pool_df
+
+
+# ─────────────────────────────────────────
+# 达人信息自动搜集（粉丝量 / 联系方式）
+# ─────────────────────────────────────────
+def _format_followers(count):
+    """格式化粉丝数为易读形式"""
+    try:
+        n = int(count)
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M"
+        elif n >= 1_000:
+            return f"{n / 1_000:.1f}K"
+        return str(n)
+    except (ValueError, TypeError):
+        return str(count)
+
+
+def _search_kol_info(kol_name):
+    """
+    尝试从互联网搜集KOL的粉丝量和联系方式。
+    依次尝试：Instagram页面 → SocialBlade。
+    返回 (fans_str, contact_str)，找不到则返回 ("", "")。
+    每次调用最多发出 2 个 HTTP 请求，超时 10 秒。
+    """
+    import re
+
+    fans = ""
+    contact = ""
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    # 1. 尝试 Instagram 页面
+    try:
+        url = f"https://www.instagram.com/{kol_name}/"
+        resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+        if resp.status_code == 200:
+            text = resp.text
+            # 粉丝数（JSON 片段）
+            m = re.search(r'"edge_followed_by"\s*:\s*\{"count"\s*:\s*(\d+)', text)
+            if not m:
+                # 备用：meta description 里的数字
+                m = re.search(r'([\d,]+)\s+Followers', text)
+            if m:
+                raw = m.group(1).replace(",", "")
+                fans = _format_followers(raw)
+            # 邮箱（Instagram bio 里可能有）
+            emails = re.findall(
+                r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', text
+            )
+            _skip = {"sentry", "instagram", "facebook", "example", "test",
+                     "support", "privacy", "noreply", "help"}
+            for email in emails:
+                if not any(s in email.lower() for s in _skip):
+                    contact = email
+                    break
+    except Exception:
+        pass
+
+    # 2. 如果 Instagram 没拿到粉丝量，尝试 SocialBlade
+    if not fans:
+        try:
+            url = f"https://socialblade.com/instagram/user/{kol_name}"
+            resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+            if resp.status_code == 200:
+                text = resp.text
+                m = re.search(r'Followers[^<]{0,60}?([0-9][0-9,\.]+[KMBkmb]?)', text)
+                if m:
+                    fans = m.group(1).strip()
+        except Exception:
+            pass
+
+    return fans, contact
+
+
+def collect_kol_info(pool_df):
+    """
+    对粉丝量或联系方式为空的达人，自动从互联网搜集信息。
+    已有完整数据的行不重复搜集。
+    搜集失败不阻塞流程。
+    """
+    if pool_df.empty:
+        return pool_df
+
+    need_collect = []
+    for idx in pool_df.index:
+        kol = str(pool_df.at[idx, "达人"]).strip()
+        if not kol or kol in ("nan", "None", ""):
+            continue
+        fans = str(pool_df.at[idx, "粉丝量"]).strip() if "粉丝量" in pool_df.columns else ""
+        contact = str(pool_df.at[idx, "联系方式"]).strip() if "联系方式" in pool_df.columns else ""
+        fans_empty = fans in ("", "nan", "None", "0")
+        contact_empty = contact in ("", "nan", "None")
+        if fans_empty or contact_empty:
+            need_collect.append((idx, kol, fans_empty, contact_empty))
+
+    if not need_collect:
+        return pool_df
+
+    print(f"  [搜集] 需要补充信息的达人: {len(need_collect)} 人")
+    updated = 0
+    for idx, kol, fans_empty, contact_empty in need_collect:
+        print(f"  [搜集] {kol} ...", end=" ", flush=True)
+        try:
+            new_fans, new_contact = _search_kol_info(kol)
+            changed = []
+            if fans_empty and new_fans:
+                pool_df.at[idx, "粉丝量"] = new_fans
+                changed.append(f"粉丝量={new_fans}")
+            if contact_empty and new_contact:
+                pool_df.at[idx, "联系方式"] = new_contact
+                changed.append(f"联系方式={new_contact}")
+            if changed:
+                updated += 1
+                print(" | ".join(changed))
+            else:
+                print("未找到")
+        except Exception as e:
+            print(f"失败: {e}")
+
+    print(f"  [搜集] 共补充 {updated} 位达人的信息")
+    return pool_df
 
 
 # ─────────────────────────────────────────
@@ -1548,6 +1688,11 @@ def cmd_init():
     # 初始化时也自动更新达人池
     print("[*] 自动更新达人池...")
     pool_df = update_pool_from_detail(detail_df, pool_df)
+
+    # 自动搜集粉丝量和联系方式
+    print("\n[*] 自动搜集达人粉丝量和联系方式...")
+    pool_df = collect_kol_info(pool_df)
+
     summary_df = compute_summary(detail_df)
 
     write_excel(detail_df, summary_df, pool_df, DB_PATH)
@@ -1618,6 +1763,10 @@ def cmd_update(days=None, month=None, fetch_all=False):
     # ── 自动更新达人池 ──
     print("\n[*] 自动更新达人池...")
     pool_df = update_pool_from_detail(merged_df, pool_df)
+
+    # ── 自动搜集粉丝量和联系方式（仅对空缺项）──
+    print("\n[*] 自动搜集达人粉丝量和联系方式...")
+    pool_df = collect_kol_info(pool_df)
 
     write_excel(merged_df, summary_df, pool_df, DB_PATH)
 
